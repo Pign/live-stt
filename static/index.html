@@ -35,21 +35,10 @@
 </head>
 <body>
   <h1>Live STT</h1>
-  <p class="sub">Transcription vocale en temps réel (faster-whisper, multilingue).</p>
+  <p class="sub">Transcription vocale en temps réel (sherpa-onnx, zipformer streaming FR).</p>
 
   <div class="controls">
     <button id="toggle" class="primary">Démarrer</button>
-    <label>Langue
-      <select id="lang">
-        <option value="fr" selected>Français</option>
-        <option value="en">English</option>
-        <option value="es">Español</option>
-        <option value="de">Deutsch</option>
-        <option value="it">Italiano</option>
-        <option value="pt">Português</option>
-        <option value="">Auto</option>
-      </select>
-    </label>
     <div class="level"><div id="level"></div></div>
     <span id="status">Prêt.</span>
   </div>

@@ -1,48 +1,62 @@
-"""Real-time speech-to-text server using faster-whisper + WebRTC VAD.
+"""Real-time speech-to-text server using sherpa-onnx streaming zipformer.
 
 The browser streams 16 kHz mono PCM (int16) frames over a WebSocket. The
-server runs voice activity detection on 30 ms frames, accumulates speech
-into utterances, and transcribes each finalized utterance with
-faster-whisper. Partial hypotheses are emitted while the user is still
-speaking so the UI feels live.
+server feeds them to a sherpa-onnx OnlineRecognizer which performs streaming
+ASR with built-in endpoint detection. Partial hypotheses are emitted as the
+user speaks; on endpoint detection a final transcript is emitted and the
+stream is reset for the next utterance.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
-import time
-from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
-import webrtcvad
+import sherpa_onnx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from faster_whisper import WhisperModel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("live-stt")
 
 SAMPLE_RATE = 16_000
-FRAME_MS = 30
-FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000  # 480 samples
-FRAME_BYTES = FRAME_SAMPLES * 2  # int16
+MODEL_DIR = Path(os.getenv(
+    "STT_MODEL_DIR",
+    "models/sherpa-onnx-streaming-zipformer-fr-2023-04-14",
+))
 
-# Tunables via env vars so the same server runs on CPU laptop and GPU box.
-MODEL_SIZE = os.getenv("STT_MODEL", "small")
-DEVICE = os.getenv("STT_DEVICE", "cpu")
-COMPUTE_TYPE = os.getenv("STT_COMPUTE", "int8" if DEVICE == "cpu" else "float16")
-LANGUAGE = os.getenv("STT_LANGUAGE", "fr")
-VAD_AGGRESSIVENESS = int(os.getenv("STT_VAD", "2"))  # 0..3
-SILENCE_MS_END = int(os.getenv("STT_SILENCE_MS", "600"))
-PARTIAL_EVERY_MS = int(os.getenv("STT_PARTIAL_MS", "700"))
-MIN_UTTERANCE_MS = int(os.getenv("STT_MIN_UTTERANCE_MS", "300"))
-MAX_UTTERANCE_MS = int(os.getenv("STT_MAX_UTTERANCE_MS", "20000"))
 
-log.info("Loading faster-whisper model=%s device=%s compute=%s lang=%s",
-         MODEL_SIZE, DEVICE, COMPUTE_TYPE, LANGUAGE)
-model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
+def _resolve(pattern: str) -> str:
+    matches = sorted(MODEL_DIR.glob(pattern))
+    if not matches:
+        raise FileNotFoundError(
+            f"Missing {pattern} under {MODEL_DIR}. Run ./download_model.sh first."
+        )
+    # Prefer int8 weights if available (faster on CPU).
+    int8 = [m for m in matches if "int8" in m.name]
+    return str((int8 or matches)[0])
+
+
+log.info("Loading sherpa-onnx streaming zipformer from %s", MODEL_DIR)
+recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
+    tokens=str(MODEL_DIR / "tokens.txt"),
+    encoder=_resolve("encoder-*.onnx"),
+    decoder=_resolve("decoder-*.onnx"),
+    joiner=_resolve("joiner-*.onnx"),
+    num_threads=int(os.getenv("STT_THREADS", "2")),
+    sample_rate=SAMPLE_RATE,
+    feature_dim=80,
+    enable_endpoint_detection=True,
+    rule1_min_trailing_silence=2.4,
+    rule2_min_trailing_silence=1.2,
+    rule3_min_utterance_length=20.0,
+    decoding_method="greedy_search",
+    provider=os.getenv("STT_PROVIDER", "cpu"),
+)
 log.info("Model loaded.")
 
 app = FastAPI()
@@ -56,139 +70,63 @@ async def index() -> FileResponse:
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
-@dataclass
-class Session:
-    vad: webrtcvad.Vad = field(default_factory=lambda: webrtcvad.Vad(VAD_AGGRESSIVENESS))
-    pcm_buffer: bytearray = field(default_factory=bytearray)  # leftover bytes < one frame
-    utterance: bytearray = field(default_factory=bytearray)   # current utterance audio
-    in_speech: bool = False
-    silence_ms: int = 0
-    speech_ms: int = 0
-    last_partial_ms: int = 0
-    seq: int = 0  # monotonic id assigned to each finalized utterance
-
-
-def transcribe_pcm(pcm_bytes: bytes, language: str) -> str:
-    """Run faster-whisper on raw int16 PCM bytes. Returns concatenated text."""
-    if not pcm_bytes:
-        return ""
-    audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-    segments, _info = model.transcribe(
-        audio,
-        language=language,
-        beam_size=1,
-        vad_filter=False,
-        condition_on_previous_text=False,
-    )
-    return "".join(seg.text for seg in segments).strip()
-
-
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
     await ws.accept()
-    session = Session()
-    language = LANGUAGE
-    loop = asyncio.get_running_loop()
+    stream = recognizer.create_stream()
+    last_partial = ""
+    seq = 0
     log.info("Client connected")
-
-    async def send(payload: dict) -> None:
-        try:
-            await ws.send_json(payload)
-        except Exception:
-            pass
 
     try:
         while True:
             message = await ws.receive()
+
             if "text" in message and message["text"] is not None:
-                # Control messages: {"type":"config","language":"fr"} or {"type":"flush"}
                 try:
-                    import json
                     cmd = json.loads(message["text"])
                 except Exception:
                     continue
-                if cmd.get("type") == "config" and cmd.get("language"):
-                    language = cmd["language"]
-                    log.info("Language set to %s", language)
-                elif cmd.get("type") == "flush":
-                    await _finalize(session, language, send, loop)
+                if cmd.get("type") == "flush":
+                    # Pad with silence to flush the encoder, then drain.
+                    stream.accept_waveform(SAMPLE_RATE, np.zeros(SAMPLE_RATE // 2, dtype=np.float32))
+                    stream.input_finished()
+                    while recognizer.is_ready(stream):
+                        recognizer.decode_stream(stream)
+                    text = recognizer.get_result(stream).text.strip()
+                    if text:
+                        await ws.send_json({"type": "final", "seq": seq, "text": text})
+                        seq += 1
+                    recognizer.reset(stream)
+                    last_partial = ""
                 continue
 
             data = message.get("bytes")
             if not data:
                 continue
 
-            session.pcm_buffer.extend(data)
+            samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+            stream.accept_waveform(SAMPLE_RATE, samples)
 
-            while len(session.pcm_buffer) >= FRAME_BYTES:
-                frame = bytes(session.pcm_buffer[:FRAME_BYTES])
-                del session.pcm_buffer[:FRAME_BYTES]
-                is_speech = session.vad.is_speech(frame, SAMPLE_RATE)
+            while recognizer.is_ready(stream):
+                recognizer.decode_stream(stream)
 
-                if is_speech:
-                    session.utterance.extend(frame)
-                    session.speech_ms += FRAME_MS
-                    session.silence_ms = 0
-                    session.in_speech = True
-                elif session.in_speech:
-                    # Trailing silence still belongs to the utterance for context.
-                    session.utterance.extend(frame)
-                    session.silence_ms += FRAME_MS
+            text = recognizer.get_result(stream).text.strip()
 
-                # Emit partials while we're inside an utterance.
-                if (
-                    session.in_speech
-                    and session.speech_ms >= MIN_UTTERANCE_MS
-                    and session.speech_ms - session.last_partial_ms >= PARTIAL_EVERY_MS
-                ):
-                    session.last_partial_ms = session.speech_ms
-                    pcm = bytes(session.utterance)
-                    asyncio.create_task(_emit_partial(pcm, language, send, loop, session.seq))
+            if recognizer.is_endpoint(stream):
+                if text:
+                    await ws.send_json({"type": "final", "seq": seq, "text": text})
+                    seq += 1
+                recognizer.reset(stream)
+                last_partial = ""
+            elif text and text != last_partial:
+                await ws.send_json({"type": "partial", "seq": seq, "text": text})
+                last_partial = text
 
-                # End-of-utterance: enough trailing silence, or hard cap reached.
-                if session.in_speech and (
-                    session.silence_ms >= SILENCE_MS_END
-                    or session.speech_ms >= MAX_UTTERANCE_MS
-                ):
-                    await _finalize(session, language, send, loop)
     except WebSocketDisconnect:
         log.info("Client disconnected")
-    except Exception as exc:
-        log.exception("WebSocket error: %s", exc)
-    finally:
-        await _finalize(session, language, send, loop)
-
-
-async def _emit_partial(pcm: bytes, language: str, send, loop, seq: int) -> None:
-    t0 = time.monotonic()
-    text = await loop.run_in_executor(None, transcribe_pcm, pcm, language)
-    if text:
-        await send({"type": "partial", "seq": seq, "text": text,
-                    "latency_ms": int((time.monotonic() - t0) * 1000)})
-
-
-async def _finalize(session: Session, language: str, send, loop) -> None:
-    if session.speech_ms < MIN_UTTERANCE_MS or not session.utterance:
-        session.utterance.clear()
-        session.in_speech = False
-        session.silence_ms = 0
-        session.speech_ms = 0
-        session.last_partial_ms = 0
-        return
-
-    pcm = bytes(session.utterance)
-    seq = session.seq
-    session.seq += 1
-    session.utterance.clear()
-    session.in_speech = False
-    session.silence_ms = 0
-    session.speech_ms = 0
-    session.last_partial_ms = 0
-
-    t0 = time.monotonic()
-    text = await loop.run_in_executor(None, transcribe_pcm, pcm, language)
-    await send({"type": "final", "seq": seq, "text": text,
-                "latency_ms": int((time.monotonic() - t0) * 1000)})
+    except Exception:
+        log.exception("WebSocket error")
 
 
 if __name__ == "__main__":

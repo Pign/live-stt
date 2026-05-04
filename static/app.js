@@ -2,7 +2,6 @@ const TARGET_SR = 16000;
 
 const $toggle = document.getElementById("toggle");
 const $status = document.getElementById("status");
-const $lang = document.getElementById("lang");
 const $level = document.getElementById("level");
 const $transcript = document.getElementById("transcript");
 
@@ -81,8 +80,6 @@ async function start() {
     ws.onerror = reject;
   });
 
-  ws.send(JSON.stringify({ type: "config", language: $lang.value }));
-
   ws.onmessage = (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
@@ -146,10 +143,4 @@ async function stop() {
 
 $toggle.addEventListener("click", () => {
   if (recording) stop(); else start();
-});
-
-$lang.addEventListener("change", () => {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: "config", language: $lang.value }));
-  }
 });
